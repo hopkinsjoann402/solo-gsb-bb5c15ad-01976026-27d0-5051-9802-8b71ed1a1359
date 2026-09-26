@@ -257,6 +257,28 @@ def _iter_playback(root, tempo_map=None):
         yield node, seq, bpm
 
 
+def source_measures(root):
+    """按源谱输入顺序返回小节节点列表（迭代实现，避免深嵌套递归溢出）。
+
+    不展开反复：分组只用于确定嵌套结构，返回顺序与输入行顺序一致。
+    """
+    nodes = []
+    stack = [[root["children"], 0]]  # 帧结构：[子节点列表, 下一个待处理下标]
+    while stack:
+        frame = stack[-1]
+        children, idx = frame
+        if idx >= len(children):
+            stack.pop()
+            continue
+        node = children[idx]
+        frame[1] += 1
+        if node["type"] == "measure":
+            nodes.append(node)
+        else:
+            stack.append([node["children"], 0])
+    return nodes
+
+
 def expand(root, limit=MAX_MEASURES, tempo_map=None):
     """按嵌套层级展开为实际演奏顺序。
 
@@ -331,3 +353,68 @@ def beats_in_window(root, start_ms, end_ms,
         # 整小节在窗口之前时按小节跨度跳过，不逐拍展开
         elapsed += duration
     return beats, None
+
+
+def locate_segments(root, start_num, end_num, tempo_map=None, limit=MAX_MEASURES):
+    """定位源谱范围在实际演奏中被完整、连续奏出的全部片段。
+
+    范围按源谱输入顺序确定：从编号 start_num 所在行到 end_num 所在行
+    （含端点）之间的所有小节构成目标序列。一次匹配要求展开后的演奏序列
+    逐小节连续、等序地经过该序列；反复回跳或内层反复插入额外小节会中断
+    连续性，不能跨处拼接成片段。速度轨迹与毫秒取整规则同 expand，
+    tempo_map 按演奏序号生效。
+
+    返回 (result, error)：
+    - result 为 {"measures": 目标序列小节数,
+                 "segments": [{"start_seq": 起始演奏序号, "end_seq": 结束演奏序号,
+                               "start_ms": 起始毫秒, "end_ms": 结束毫秒,
+                               "duration_ms": 时长毫秒}, ...]}；无匹配时 segments 为空
+    - error  为 None，或 {"kind": "missing", "which": "start" | "end", "num": 编号}
+                       | {"kind": "order", "start_num": 起点编号,
+                          "start_line": 起点行号, "end_num": 终点编号,
+                          "end_line": 终点行号}
+                       | {"kind": "overflow", "node": 导致超限的小节节点}
+    """
+    source = source_measures(root)
+    # 编号唯一（parse 已校验），编号 -> 源谱输入顺序中的位置
+    positions = {node["num"]: i for i, node in enumerate(source)}
+    if start_num not in positions:
+        return None, {"kind": "missing", "which": "start", "num": start_num}
+    if end_num not in positions:
+        return None, {"kind": "missing", "which": "end", "num": end_num}
+    first, last = positions[start_num], positions[end_num]
+    if first > last:
+        return None, {
+            "kind": "order",
+            "start_num": start_num, "start_line": source[first]["line"],
+            "end_num": end_num, "end_line": source[last]["line"],
+        }
+    pattern = [node["num"] for node in source[first:last + 1]]
+
+    # 展开并记录每个演奏小节的编号与起止毫秒（与 expand 相同的累计与取整规则）
+    nums = []
+    spans = []  # 每个演奏小节的 (start_ms, end_ms)
+    elapsed = 0.0  # 已累计的演奏时长（毫秒，保留精度）
+    for node, _seq, bpm in _iter_playback(root, tempo_map):
+        duration = node["beats"] * 60000 / bpm
+        nums.append(node["num"])
+        spans.append((_round_ms(elapsed), _round_ms(elapsed + duration)))
+        elapsed += duration
+        if len(nums) > limit:
+            return None, {"kind": "overflow", "node": node}
+
+    # 滑动窗口匹配目标序列；源谱编号唯一，不同匹配之间不可能重叠
+    size = len(pattern)
+    segments = []
+    for i in range(len(nums) - size + 1):
+        if nums[i:i + size] == pattern:
+            start_ms = spans[i][0]
+            end_ms = spans[i + size - 1][1]
+            segments.append({
+                "start_seq": i + 1,
+                "end_seq": i + size,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "duration_ms": end_ms - start_ms,
+            })
+    return {"measures": size, "segments": segments}, None
