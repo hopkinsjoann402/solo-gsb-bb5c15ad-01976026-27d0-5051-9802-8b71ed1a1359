@@ -6,7 +6,8 @@ import os
 from flask import Flask, jsonify, render_template, request
 
 from repeats import (
-    MAX_BEATS, MAX_MEASURES, beats_in_window, expand, parse, parse_tempo_map,
+    MAX_BEATS, MAX_MEASURES, beats_in_window, expand, match_segments, parse,
+    parse_tempo_map, source_range_pattern,
 )
 
 app = Flask(__name__)
@@ -48,6 +49,20 @@ def _parse_window(data):
     if end_ms <= start_ms:
         return None, None, "结束毫秒必须大于起始毫秒"
     return start_ms, end_ms, None
+
+
+def _parse_measure_number(data, key, label):
+    """校验片段定位的端点小节编号，返回 (编号, 错误描述)；通过时错误描述为 None。"""
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, f"{label}小节编号必须是非负整数"
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            return None, f"{label}小节编号必须是非负整数"
+        value = int(value)
+    if value < 0:
+        return None, f"{label}小节编号必须是非负整数"
+    return value, None
 
 
 def _has_tempo(data):
@@ -156,6 +171,57 @@ def api_beats():
         return jsonify({"ok": False, "overflow": True, "errors": [error]})
 
     return jsonify({"ok": True, "count": len(beats), "beats": beats})
+
+
+@app.post("/api/segments")
+def api_segments():
+    data = request.get_json(silent=True) or {}
+    text = data.get("input", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({
+            "ok": False,
+            "errors": [{"line": None, "message": "输入为空，请逐行输入小节编号"}],
+        })
+
+    root, errors = parse(text)
+    if errors:
+        return jsonify({"ok": False, "errors": errors})
+
+    endpoints = {}
+    for label, key in (("起点", "start_num"), ("终点", "end_num")):
+        num, err = _parse_measure_number(data, key, label)
+        if err is not None:
+            return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
+        endpoints[key] = num
+
+    # 范围按源谱输入顺序确定：端点须存在且起点不得晚于终点
+    pattern, err = source_range_pattern(
+        root, endpoints["start_num"], endpoints["end_num"])
+    if err is not None:
+        return jsonify({"ok": False, "errors": [{"line": None, "message": err}]})
+
+    # 与展开接口一致：先展开一次取得总小节数以校验临时变速序号范围，
+    # 片段时间直接沿用展开行的起止毫秒
+    rows, overflow = expand(root)
+    if overflow is not None:
+        return jsonify({
+            "ok": False,
+            "overflow": True,
+            "errors": [_measure_overflow_error(overflow)],
+        })
+    tempo_map, tempo_errors = _parse_tempo(data, len(rows))
+    if tempo_errors:
+        return jsonify({"ok": False, "errors": tempo_errors})
+    if tempo_map:
+        rows, _ = expand(root, tempo_map=tempo_map)
+
+    segments = match_segments(rows, pattern)
+    return jsonify({
+        "ok": True,
+        "count": len(segments),
+        "pattern": pattern,
+        "segments": segments,
+    })
 
 
 if __name__ == "__main__":

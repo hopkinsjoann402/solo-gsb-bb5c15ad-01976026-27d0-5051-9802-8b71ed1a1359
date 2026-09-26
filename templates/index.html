@@ -46,7 +46,7 @@
     background: #ffebe9; border: 1px solid #ffb3ad; border-radius: 8px;
     color: #a40e26; font-size: 14px; line-height: 1.8;
   }
-  #summary, #beatSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  #summary, #beatSummary, #segmentSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
   table {
     width: 100%; border-collapse: collapse; background: #fff;
     border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
@@ -111,6 +111,26 @@
     </thead>
     <tbody></tbody>
   </table>
+
+  <h2>排练片段定位</h2>
+  <p class="hint">
+    输入起止原谱小节编号，范围按源谱输入顺序确定（端点须存在且起点不得晚于终点），
+    列出该范围在实际演奏中每次被完整、连续奏出的片段：起止演奏序号、起止毫秒与时长。
+    一次匹配必须逐小节遵循源谱顺序，反复回跳或内层反复插入额外小节时不能拼接成片段；
+    时间规则与展开一致，临时变速按演奏序号生效。
+  </p>
+  <div class="toolbar">
+    <input id="startNum" type="number" min="0" step="1" placeholder="起点原谱小节编号">
+    <input id="endNum" type="number" min="0" step="1" placeholder="终点原谱小节编号">
+    <button id="segmentsBtn" class="primary">定位片段</button>
+  </div>
+  <p id="segmentSummary"></p>
+  <table id="segmentResult" hidden>
+    <thead>
+      <tr><th>起始演奏序号</th><th>结束演奏序号</th><th>起始时间(毫秒)</th><th>结束时间(毫秒)</th><th>时长(毫秒)</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
 <script>
@@ -133,11 +153,16 @@ $("beatsBtn").addEventListener("click", doBeatQuery);
 for (const id of ["startMs", "endMs"]) {
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doBeatQuery(); });
 }
+$("segmentsBtn").addEventListener("click", doSegmentQuery);
+for (const id of ["startNum", "endNum"]) {
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doSegmentQuery(); });
+}
 
 function reset() {
   $("errors").innerHTML = "";
   resetExpand();
   resetBeats();
+  resetSegments();
 }
 
 function resetExpand() {
@@ -152,6 +177,12 @@ function resetBeats() {
   $("beatSummary").textContent = "";
   $("beatResult").hidden = true;
   $("beatResult").querySelector("tbody").innerHTML = "";
+}
+
+function resetSegments() {
+  $("segmentSummary").textContent = "";
+  $("segmentResult").hidden = true;
+  $("segmentResult").querySelector("tbody").innerHTML = "";
 }
 
 async function doExpand() {
@@ -249,6 +280,54 @@ async function doBeatQuery() {
   }
   tbody.appendChild(frag);
   $("beatResult").hidden = false;
+}
+
+async function doSegmentQuery() {
+  $("errors").innerHTML = "";
+  resetSegments();
+  // 空值或非数字（NaN 经 JSON 序列化也为 null）交由服务端校验
+  const toNum = (id) => {
+    const v = $(id).value.trim();
+    return v === "" ? null : Number(v);
+  };
+  let data;
+  try {
+    const resp = await fetch("/api/segments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: $("input").value,
+        start_num: toNum("startNum"),
+        end_num: toNum("endNum"),
+        tempo: $("tempo").value,
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    showErrors([{ line: null, message: "请求失败：" + e }]);
+    return;
+  }
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    return;
+  }
+  $("segmentSummary").textContent = data.count
+    ? `源谱范围 ${data.pattern.join(" ")} 共定位到 ${data.count} 个片段`
+    : `源谱范围 ${data.pattern.join(" ")} 在实际演奏中没有完整、连续奏出的片段`;
+  if (!data.count) return;
+  const tbody = $("segmentResult").querySelector("tbody");
+  const frag = document.createDocumentFragment();
+  for (const s of data.segments) {
+    const tr = document.createElement("tr");
+    for (const v of [s.start_seq, s.end_seq, s.start_ms, s.end_ms, s.duration_ms]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }
+    frag.appendChild(tr);
+  }
+  tbody.appendChild(frag);
+  $("segmentResult").hidden = false;
 }
 
 function downloadCsv() {

@@ -1,4 +1,4 @@
-"""反复段解析与展开核心逻辑。
+"""反复段解析与展开核心逻辑：展开、排练时间轴、节拍点查询与排练片段定位。
 
 输入格式（逐行）：
     [|:]小节编号[:|xN][拍数@BPM]
@@ -237,6 +237,17 @@ def _iter_measures(root):
             stack.append([node["children"], 0, node["count"]])
 
 
+def _iter_source_measures(root):
+    """按源谱输入顺序迭代产生小节节点（保持源谱结构，不展开反复）。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node["type"] == "measure":
+            yield node
+        else:
+            stack.extend(reversed(node["children"]))
+
+
 def _iter_playback(root, tempo_map=None):
     """按实际演奏顺序产生 (小节节点, 演奏序号, 当前 BPM)。
 
@@ -283,6 +294,70 @@ def expand(root, limit=MAX_MEASURES, tempo_map=None):
         if len(rows) > limit:
             return rows, node
     return rows, None
+
+
+def source_range_pattern(root, start_num, end_num):
+    """按源谱输入顺序确定起止小节编号对应的编号序列（片段定位的匹配模式）。
+
+    返回 (pattern, 错误描述)；通过时错误描述为 None。
+    两个端点都必须存在于源谱，且起点在源谱输入顺序中的位置不得晚于终点。
+    """
+    nums = [node["num"] for node in _iter_source_measures(root)]
+    if start_num not in nums:
+        return None, f"起点小节编号 {start_num} 在源谱中不存在"
+    if end_num not in nums:
+        return None, f"终点小节编号 {end_num} 在源谱中不存在"
+    start_pos = nums.index(start_num)
+    end_pos = nums.index(end_num)
+    if start_pos > end_pos:
+        return None, (
+            f"起点小节编号 {start_num} 在源谱输入顺序中"
+            f"晚于终点小节编号 {end_num}"
+        )
+    return nums[start_pos:end_pos + 1], None
+
+
+def match_segments(rows, pattern):
+    """在展开结果中查找连续、完整奏出 pattern 的片段（排练片段定位）。
+
+    一次匹配必须逐小节按 pattern 顺序连续出现：反复回跳或内层反复
+    插入的额外小节会中断匹配，不能跨越拼接成片段。pattern 中编号互不相同
+    （源谱编号唯一），失配时只需判断当前行能否从头开始新匹配。
+
+    rows 为 expand 的展开行（含 seq、num、start_ms、end_ms），
+    片段的起止毫秒直接沿用这些行，时长为两者之差，
+    因此速度与毫秒规则（含临时变速）与展开接口完全一致。
+
+    返回 [{"start_seq": 起始演奏序号, "end_seq": 结束演奏序号,
+           "start_ms": 起始毫秒, "end_ms": 结束毫秒,
+           "duration_ms": 时长毫秒}, ...]
+    """
+    segments = []
+    progress = 0  # 当前已连续匹配的小节数
+    first = None  # 当前匹配的起始展开行
+    for row in rows:
+        if row["num"] == pattern[progress]:
+            if progress == 0:
+                first = row
+            progress += 1
+            if progress == len(pattern):
+                segments.append({
+                    "start_seq": first["seq"],
+                    "end_seq": row["seq"],
+                    "start_ms": first["start_ms"],
+                    "end_ms": row["end_ms"],
+                    "duration_ms": row["end_ms"] - first["start_ms"],
+                })
+                progress = 0
+                first = None
+        elif row["num"] == pattern[0]:
+            # 失配但当前行可从头开始新匹配（编号唯一，无需更长的回退）
+            first = row
+            progress = 1
+        else:
+            progress = 0
+            first = None
+    return segments
 
 
 def beats_in_window(root, start_ms, end_ms,
